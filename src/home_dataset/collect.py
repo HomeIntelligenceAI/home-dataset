@@ -5,8 +5,20 @@ Supports Hugging Face datasets and local text files.
 """
 
 import argparse
-import pathlib
 import json
+import pathlib
+import urllib.parse
+import urllib.request
+
+# Wikimedia rejects the default urllib agent with 403. A descriptive agent is
+# their documented requirement, not a workaround.
+USER_AGENT = "HomeAI-dataset/0.1 (https://github.com/HomeIntelligenceAI/home-dataset)"
+
+
+def _request(url: str, timeout: int = 30) -> bytes:
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read()
 
 
 def load_from_huggingface(dataset_name: str, split: str = "train",
@@ -47,6 +59,46 @@ def load_from_huggingface(dataset_name: str, split: str = "train",
 
     print(f"[Dataset] Saved {count} samples to {out_file}")
     return out_file
+
+
+def fetch_url(url: str, destination: pathlib.Path, timeout: int = 60) -> pathlib.Path:
+    """Download a plain-text file."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(_request(url, timeout=timeout))
+    return destination
+
+
+def fetch_wikipedia(lang: str, limit: int = 200, min_chars: int = 500,
+                    timeout: int = 30):
+    """Yield article extracts from a Wikipedia edition.
+
+    generator=random rather than a fixed list, so repeat runs widen coverage
+    instead of re-fetching the same head articles.
+    """
+    endpoint = f"https://{lang}.wikipedia.org/w/api.php"
+    fetched = 0
+    # The API caps extracts at 20 pages per request regardless of what is asked.
+    while fetched < limit:
+        params = {
+            "action": "query", "format": "json",
+            "generator": "random", "grnnamespace": "0", "grnlimit": "20",
+            "prop": "extracts", "explaintext": "1", "exlimit": "20",
+        }
+        url = f"{endpoint}?{urllib.parse.urlencode(params)}"
+        try:
+            payload = json.loads(_request(url, timeout=timeout))
+        except Exception:  # a flaky page must not kill a long crawl
+            break
+        pages = payload.get("query", {}).get("pages", {})
+        if not pages:
+            break
+        for page in pages.values():
+            extract = (page.get("extract") or "").strip()
+            if len(extract) >= min_chars:
+                yield extract
+                fetched += 1
+                if fetched >= limit:
+                    return
 
 
 def load_local_text(text_dir: str, output_dir: str = "data") -> pathlib.Path:
