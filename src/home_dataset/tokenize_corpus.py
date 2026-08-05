@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from collections.abc import Iterator
 from multiprocessing import Pool
@@ -52,24 +53,34 @@ def _encode_chunk(texts: list[str]) -> list[int]:
     return out
 
 
-def _chunks(path: Path, size: int, limit: int | None) -> Iterator[list[str]]:
+def _chunks(
+    paths: list[Path], size: int, limit: int | None
+) -> Iterator[list[str]]:
+    """Stream documents from one or more JSONL files as fixed-size batches.
+
+    Multiple inputs are concatenated in the order given, so the validation tail
+    comes from the last source listed. Put the most representative source last.
+    """
     batch: list[str] = []
-    with path.open(encoding="utf-8") as handle:
-        for i, line in enumerate(handle):
-            if limit is not None and i >= limit:
-                break
-            text = json.loads(line).get("text")
-            if text:
-                batch.append(text)
-            if len(batch) >= size:
-                yield batch
-                batch = []
+    seen = 0
+    for path in paths:
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                if limit is not None and seen >= limit:
+                    break
+                seen += 1
+                text = json.loads(line).get("text")
+                if text:
+                    batch.append(text)
+                if len(batch) >= size:
+                    yield batch
+                    batch = []
     if batch:
         yield batch
 
 
 def tokenize_corpus(
-    input_path: Path,
+    input_paths: list[Path],
     vocab_path: Path,
     out_dir: Path,
     workers: int = 8,
@@ -77,36 +88,61 @@ def tokenize_corpus(
     val_fraction: float = 0.002,
     limit: int | None = None,
 ) -> dict[str, object]:
-    from home_training.data import write_tokens
+    """Tokenise to disk incrementally.
+
+    Everything is streamed. An earlier version accumulated the whole corpus in
+    a Python list before writing, which is fine at 280M tokens and fatal at 1B:
+    a Python int is ~28 bytes, so a billion of them is ~28 GB of RAM. It died
+    with MemoryError 55 minutes into a run.
+    """
+    from home_training.data import TOKEN_DTYPE, DataStats
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    train_path, val_path = out_dir / "train.bin", out_dir / "val.bin"
     started = time.perf_counter()
-    tokens: list[int] = []
 
-    with Pool(workers, initializer=_init_worker, initargs=(str(vocab_path),)) as pool:
+    total = 0
+    first_block: np.ndarray | None = None
+
+    with (
+        Pool(workers, initializer=_init_worker, initargs=(str(vocab_path),)) as pool,
+        train_path.open("wb") as sink,
+    ):
         for done, part in enumerate(
             # imap keeps ordering, which matters: the val split is taken from
             # the tail, and a shuffled stream would put training text in it.
-            pool.imap(_encode_chunk, _chunks(input_path, chunk_size, limit)),
+            pool.imap(_encode_chunk, _chunks(input_paths, chunk_size, limit)),
             start=1,
         ):
-            tokens.extend(part)
+            block = np.asarray(part, dtype=TOKEN_DTYPE)
+            block.tofile(sink)
+            total += block.size
+            if first_block is None:
+                first_block = block
             if done % 40 == 0:
                 elapsed = time.perf_counter() - started
                 print(
-                    f"  {done * chunk_size:>9,} docs  {len(tokens) / 1e6:>7.1f}M tokens  "
-                    f"{elapsed:>5.0f}s  {len(tokens) / elapsed / 1e3:>6.0f}k tok/s",
+                    f"  {done * chunk_size:>9,} docs  {total / 1e6:>7.1f}M tokens  "
+                    f"{elapsed:>5.0f}s  {total / elapsed / 1e3:>6.0f}k tok/s",
                     flush=True,
                 )
 
-    split = int(len(tokens) * (1.0 - val_fraction))
-    train_stats = write_tokens(out_dir / "train.bin", tokens[:split])
-    val_stats = write_tokens(out_dir / "val.bin", tokens[split:])
+    # Split by moving the tail into val.bin, then truncating train.bin --
+    # no second pass over the data and no second copy on disk.
+    val_count = max(1, int(total * val_fraction))
+    split_at = total - val_count
+    stream = np.memmap(train_path, dtype=TOKEN_DTYPE, mode="r")
+    np.asarray(stream[split_at:]).tofile(val_path)
+    del stream
+    os.truncate(train_path, split_at * np.dtype(TOKEN_DTYPE).itemsize)
 
-    unique = len(np.unique(np.asarray(tokens[: min(len(tokens), 5_000_000)])))
+    sample = np.memmap(train_path, dtype=TOKEN_DTYPE, mode="r")[:5_000_000]
+    unique = int(np.unique(np.asarray(sample)).size)
+    del sample
+
     return {
-        "train": train_stats,
-        "val": val_stats,
+        "train": DataStats(split_at, train_path.stat().st_size),
+        "val": DataStats(val_count, val_path.stat().st_size),
         "elapsed_s": time.perf_counter() - started,
         "distinct_tokens_in_first_5M": unique,
     }
@@ -114,7 +150,8 @@ def tokenize_corpus(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Tokenise a JSONL corpus")
-    parser.add_argument("--input", type=Path, required=True)
+    parser.add_argument("--input", type=Path, nargs="+", required=True,
+                        help="One or more JSONL files, concatenated in order")
     parser.add_argument("--vocab", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--workers", type=int, default=8)
@@ -122,6 +159,8 @@ def main() -> None:
     parser.add_argument("--val-fraction", type=float, default=0.002)
     args = parser.parse_args()
 
+    total_gb = sum(p.stat().st_size for p in args.input) / 1e9
+    print(f"tokenising {len(args.input)} file(s), {total_gb:.1f} GB", flush=True)
     result = tokenize_corpus(
         args.input,
         args.vocab,

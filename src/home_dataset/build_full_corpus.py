@@ -2,19 +2,26 @@
 
 Target: 2.77B tokens — 20 per parameter for a 138M model.
 
-R1 measured what each source actually supplies, at 0.208 tokens/char and
-2.60 bytes/char for Telugu:
+Yields, at the 0.208 tokens/char measured in R1. FineWeb and C4 are now
+DOWNLOADED numbers; the rest remain projections:
 
-    FineWeb-2 tel_Telu   1.82B tokens   1,983,328 docs
-    C4 te                0.47B          669,396
-    Sangraha verified    0.44B          1,031,867
-    IndicCorpV2          0.40B          13,498,729 (sentence-level, short)
-    Wikipedia te         0.07B          87,854
-    ------------------------------------------------
-                         3.20B before overlap
+    FineWeb-2 tel_Telu   1.22B tokens   1,964,395 docs   (downloaded, 15.5 GB)
+    C4 te                0.45B            700,000        (downloaded, 5.5 GB)
+    Sangraha verified    0.44B          1,031,867        (projected)
+    IndicCorpV2          0.40B         13,498,729        (projected, sentences)
+    Wikipedia te         0.07B             87,854        (projected)
+    ---------------------------------------------------------------
+                         2.58B before overlap
 
-Cross-source overlap measured at 0–7%, so ~3.0B survives — comfortably past
-the 2.77B target.
+R1 projected 1.82B for FineWeb and the real figure is 1.22B — a 48%
+overestimate, because chars-per-document was sampled from 400 documents and
+came out at 4,418 when the true average over 1.96M documents is 2,988. Small
+samples of a long-tailed distribution overestimate the mean.
+
+That puts the realistic total at ~2.58B against a 2.77B target: about 93% of
+compute-optimal. Close enough to train, but the margin R1 implied is not there.
+Unlocking CulturaX or OSCAR (both 401 without a licence accepted on the
+account) is what would restore it.
 
 Resumable: each source writes its own JSONL and is skipped if already present,
 so an interrupted run continues rather than restarting.
@@ -76,24 +83,39 @@ def fetch_source(source: Source, out_dir: Path) -> dict[str, object]:
         print(f"  {source.name}: UNAVAILABLE ({type(exc).__name__}) -- skipping", flush=True)
         return {"source": source.name, "error": str(exc)[:120]}
 
+    interrupted: str | None = None
     with partial.open("w", encoding="utf-8") as handle:
-        for row in stream:
-            text = row.get(source.text_field) or ""
-            if len(text) < source.min_chars:
-                continue
-            handle.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
-            docs += 1
-            chars += len(text)
-            if docs % 100_000 == 0:
-                rate = docs / (time.perf_counter() - started)
-                print(
-                    f"  {source.name}: {docs:,} docs  {chars / 1e9:.2f}B chars  "
-                    f"{rate:,.0f} docs/s",
-                    flush=True,
-                )
-            if docs >= source.max_docs:
-                break
+        try:
+            for row in stream:
+                text = row.get(source.text_field) or ""
+                if len(text) < source.min_chars:
+                    continue
+                handle.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
+                docs += 1
+                chars += len(text)
+                if docs % 100_000 == 0:
+                    rate = docs / (time.perf_counter() - started)
+                    print(
+                        f"  {source.name}: {docs:,} docs  {chars / 1e9:.2f}B chars  "
+                        f"{rate:,.0f} docs/s",
+                        flush=True,
+                    )
+                if docs >= source.max_docs:
+                    break
+        except Exception as exc:  # noqa: BLE001
+            # A network blip must not discard hours of download. Keep what
+            # arrived, note why it stopped, and carry on to the next source.
+            # An earlier version let this propagate and threw away 500,000
+            # documents of Sangraha over a single getaddrinfo failure.
+            interrupted = f"{type(exc).__name__}: {str(exc)[:90]}"
+            print(
+                f"  {source.name}: interrupted after {docs:,} docs -- {interrupted}",
+                flush=True,
+            )
 
+    if docs == 0:
+        partial.unlink(missing_ok=True)
+        return {"source": source.name, "error": interrupted or "no documents"}
     partial.rename(path)
     elapsed = time.perf_counter() - started
     # 0.208 tokens/char, measured in R1 on a vocab-32,768 tokenizer.
@@ -104,6 +126,7 @@ def fetch_source(source: Source, out_dir: Path) -> dict[str, object]:
         "est_tokens": int(chars * 0.208),
         "gb": path.stat().st_size / 1e9,
         "seconds": int(elapsed),
+        "interrupted": interrupted,
     }
 
 
