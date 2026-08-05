@@ -159,8 +159,18 @@ def main() -> None:
     parser.add_argument("--val-fraction", type=float, default=0.002)
     args = parser.parse_args()
 
-    total_gb = sum(p.stat().st_size for p in args.input) / 1e9
-    print(f"tokenising {len(args.input)} file(s), {total_gb:.1f} GB", flush=True)
+    # A source that failed to download should not stop the ones that
+    # succeeded. Listing all five and having the command die on the one the
+    # network dropped is exactly the wrong failure mode for a 2-hour job.
+    present = [p for p in args.input if p.exists()]
+    for missing in [p for p in args.input if not p.exists()]:
+        print(f"  skipping {missing.name} -- not found", flush=True)
+    if not present:
+        raise SystemExit("none of the given input files exist")
+
+    total_gb = sum(p.stat().st_size for p in present) / 1e9
+    print(f"tokenising {len(present)} file(s), {total_gb:.1f} GB", flush=True)
+    args.input = present
     result = tokenize_corpus(
         args.input,
         args.vocab,
