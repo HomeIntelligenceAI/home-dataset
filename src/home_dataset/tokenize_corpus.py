@@ -54,12 +54,16 @@ def _encode_chunk(texts: list[str]) -> list[int]:
 
 
 def _chunks(
-    paths: list[Path], size: int, limit: int | None
+    paths: list[Path], size: int, limit: int | None, skip: int = 0
 ) -> Iterator[list[str]]:
     """Stream documents from one or more JSONL files as fixed-size batches.
 
     Multiple inputs are concatenated in the order given, so the validation tail
     comes from the last source listed. Put the most representative source last.
+
+    ``skip`` fast-forwards past documents already tokenised on a previous run.
+    Lines are counted without being parsed, which is far cheaper than decoding
+    JSON for text that is about to be discarded.
     """
     batch: list[str] = []
     seen = 0
@@ -69,6 +73,8 @@ def _chunks(
                 if limit is not None and seen >= limit:
                     break
                 seen += 1
+                if seen <= skip:
+                    continue
                 text = json.loads(line).get("text")
                 if text:
                     batch.append(text)
@@ -99,30 +105,59 @@ def tokenize_corpus(
 
     out_dir.mkdir(parents=True, exist_ok=True)
     train_path, val_path = out_dir / "train.bin", out_dir / "val.bin"
+    # Records documents consumed, so an interrupted run picks up rather than
+    # restarting. This job takes two hours; it has been interrupted twice, and
+    # each time the work was thrown away.
+    progress_path = out_dir / "tokenise.progress"
     started = time.perf_counter()
 
+    skip = 0
     total = 0
-    first_block: np.ndarray | None = None
+    if progress_path.exists() and train_path.exists():
+        state = json.loads(progress_path.read_text(encoding="utf-8"))
+        # Trust the byte count on disk, not the recorded token count -- if the
+        # process died mid-write the file is the authority.
+        on_disk = train_path.stat().st_size // np.dtype(TOKEN_DTYPE).itemsize
+        if on_disk == state["tokens"]:
+            skip, total = state["docs"], on_disk
+            print(
+                f"resuming: {skip:,} docs / {total / 1e6:.1f}M tokens already done",
+                flush=True,
+            )
+        else:
+            print(
+                f"progress file disagrees with train.bin "
+                f"({state['tokens']:,} vs {on_disk:,} tokens) -- restarting",
+                flush=True,
+            )
 
+    docs_done = skip
+    mode = "ab" if skip else "wb"
     with (
         Pool(workers, initializer=_init_worker, initargs=(str(vocab_path),)) as pool,
-        train_path.open("wb") as sink,
+        train_path.open(mode) as sink,
     ):
         for done, part in enumerate(
             # imap keeps ordering, which matters: the val split is taken from
             # the tail, and a shuffled stream would put training text in it.
-            pool.imap(_encode_chunk, _chunks(input_paths, chunk_size, limit)),
+            pool.imap(_encode_chunk, _chunks(input_paths, chunk_size, limit, skip)),
             start=1,
         ):
             block = np.asarray(part, dtype=TOKEN_DTYPE)
             block.tofile(sink)
             total += block.size
-            if first_block is None:
-                first_block = block
+            docs_done += chunk_size
             if done % 40 == 0:
+                sink.flush()
+                os.fsync(sink.fileno())
+                # Written only after the data it describes is durable, so the
+                # progress file can never claim more than the file holds.
+                progress_path.write_text(
+                    json.dumps({"docs": docs_done, "tokens": total}), encoding="utf-8"
+                )
                 elapsed = time.perf_counter() - started
                 print(
-                    f"  {done * chunk_size:>9,} docs  {total / 1e6:>7.1f}M tokens  "
+                    f"  {docs_done:>9,} docs  {total / 1e6:>7.1f}M tokens  "
                     f"{elapsed:>5.0f}s  {total / elapsed / 1e3:>6.0f}k tok/s",
                     flush=True,
                 )
@@ -135,6 +170,8 @@ def tokenize_corpus(
     np.asarray(stream[split_at:]).tofile(val_path)
     del stream
     os.truncate(train_path, split_at * np.dtype(TOKEN_DTYPE).itemsize)
+
+    progress_path.unlink(missing_ok=True)   # complete: nothing to resume
 
     sample = np.memmap(train_path, dtype=TOKEN_DTYPE, mode="r")[:5_000_000]
     unique = int(np.unique(np.asarray(sample)).size)
